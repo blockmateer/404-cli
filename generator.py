@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 from pathlib import Path
 from typing import Callable
 
@@ -6,11 +7,11 @@ import httpx
 
 
 class Generator:
-    """Generator for processing prompts and creating 3D models."""
+    """Generator for processing prompts and creating 3D models with multi-port load balancing."""
 
     def __init__(
         self,
-        endpoint: str,
+        endpoint: str | list[str],
         seed: int,
         output_folder: Path,
         echo: Callable[[str], None] | None = None,
@@ -19,22 +20,38 @@ class Generator:
         Initialize the Generator.
 
         Args:
-            endpoint: Generator endpoint URL
+            endpoint: Generator endpoint URL or list of endpoints for load balancing
             seed: Seed value for generation (ensures reproducibility)
             output_folder: Path to folder where .ply files will be saved
             echo: Optional callback function for logging messages
         """
-        self.endpoint = endpoint
+        # Support both single endpoint and multiple endpoints
+        if isinstance(endpoint, str):
+            self.endpoints = [endpoint]
+        else:
+            self.endpoints = endpoint
+        
+        # Create round-robin iterator for load balancing
+        self.endpoint_cycle = itertools.cycle(self.endpoints)
+        
         self.seed = seed
         self.output_folder = Path(output_folder)
         self.echo = echo or (lambda msg: None)
         
         # Create output folder if it doesn't exist
         self.output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Log configuration
+        if len(self.endpoints) > 1:
+            self.echo(f"Multi-port mode: {len(self.endpoints)} endpoints configured")
+            for i, ep in enumerate(self.endpoints):
+                self.echo(f"  Endpoint {i+1}: {ep}")
+        else:
+            self.echo(f"Single endpoint mode: {self.endpoints[0]}")
 
     async def generate_all(self, prompts: list[str]) -> None:
         """
-        Generate models for all prompts.
+        Generate models for all prompts using load-balanced endpoints.
 
         Args:
             prompts: List of image URLs to process
@@ -46,14 +63,22 @@ class Generator:
         tasks = []
         try:
             self.echo(f"Processing {len(prompts)} prompts...")
-            request_sem = asyncio.Semaphore(1)  # Using semaphores to limit request to one at a time.
-            process_sem = asyncio.Semaphore(8)  # Limiting request to control traffic
+            
+            # Configure concurrency based on number of endpoints
+            num_endpoints = len(self.endpoints)
+            # Allow 1 concurrent request per GPU (can be increased to 2 per GPU for higher throughput)
+            request_sem = asyncio.Semaphore(num_endpoints)
+            # Limit total processing to avoid overwhelming the system
+            process_sem = asyncio.Semaphore(num_endpoints * 2)
+            
+            self.echo(f"Concurrency: {num_endpoints} concurrent requests, {num_endpoints * 2} max in-flight")
+            
             tasks = [
                 asyncio.create_task(
                     self._process_prompt(
                         request_sem=request_sem,
                         process_sem=process_sem,
-                        endpoint=self.endpoint,
+                        endpoint=next(self.endpoint_cycle),  # Round-robin endpoint selection
                         prompt=prompt,
                     )
                 )
@@ -200,6 +225,10 @@ class Generator:
         """
         sem_released = False
         await request_sem.acquire()
+        
+        # Extract port from endpoint for logging
+        port = endpoint.split(":")[-1].split("/")[0] if ":" in endpoint else "unknown"
+        self.echo(f"Prompt {prompt_key} → endpoint port {port}")
 
         try:
             timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
@@ -219,7 +248,7 @@ class Generator:
                         request_sem.release()
                         sem_released = True
 
-                        self.echo(f"Prompt {prompt_key} generation completed in {elapsed:.1f}s")
+                        self.echo(f"Prompt {prompt_key} [port {port}] generation completed in {elapsed:.1f}s")
 
                         try:
                             content = await response.aread()
@@ -229,14 +258,14 @@ class Generator:
                         download_time = asyncio.get_running_loop().time() - start_time - elapsed
                         mb_size = len(content) / 1024 / 1024
                         self.echo(
-                            f"Prompt {prompt_key} generated in {elapsed:.1f}s, "
+                            f"Prompt {prompt_key} [port {port}] generated in {elapsed:.1f}s, "
                             f"downloaded in {download_time:.1f}s, {mb_size:.1f} MiB"
                         )
 
                         return content
 
                 except Exception as e:
-                    self.echo(f"Prompt {prompt_key} generation failed: {e}")
+                    self.echo(f"Prompt {prompt_key} [port {port}] generation failed: {e}")
                     return None
 
         finally:

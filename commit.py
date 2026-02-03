@@ -557,16 +557,39 @@ def stop_pods_cmd(targon_api_key: str) -> None:
 
 @cli.command("generate")
 @click.option("--prompts-file", required=True, help="Path to the file with prompts that are valid URLs.")
-@click.option("--endpoint", required=True, help="Generator endpoint URL.")
+@click.option(
+    "--endpoint",
+    multiple=True,
+    required=True,
+    help="Generator endpoint URL. Can be specified multiple times for load balancing across multiple GPUs. "
+         "Example: --endpoint http://0.0.0.0:10006 --endpoint http://0.0.0.0:10007"
+)
 @click.option("--seed", required=True, help="Seed for generation.")
 @click.option("--output-folder", default="results", help="Folder path where generated .ply files will be saved.")
 def generate_cmd(
     prompts_file: str,
-    endpoint: str,
+    endpoint: tuple[str, ...],
     seed: str,
     output_folder: str,
 ) -> None:  
-    """Generate models using the generator endpoint."""
+    """Generate models using the generator endpoint(s).
+    
+    Supports multiple endpoints for load balancing across multiple GPUs.
+    Requests will be distributed evenly across all provided endpoints.
+    
+    Examples:
+    
+        # Single endpoint (1 GPU)
+        python commit.py generate --prompts-file prompts.txt --endpoint http://0.0.0.0:10006 --seed 42
+        
+        # Multiple endpoints (4 GPUs with load balancing)
+        python commit.py generate --prompts-file prompts.txt \\
+            --endpoint http://0.0.0.0:10006 \\
+            --endpoint http://0.0.0.0:10007 \\
+            --endpoint http://0.0.0.0:10008 \\
+            --endpoint http://0.0.0.0:10009 \\
+            --seed 42
+    """
     # Read prompts from prompt file
     click.echo("Reading prompts from file...", err=True)
     try:
@@ -584,10 +607,21 @@ def generate_cmd(
         raise SystemExit(1)
     
     click.echo(f"Found {len(prompts)} prompts to process", err=True)
+    
+    # Convert tuple to list for Generator
+    endpoints = list(endpoint)
+    
+    # Log endpoint configuration
+    if len(endpoints) == 1:
+        click.echo(f"Using single endpoint: {endpoints[0]}", err=True)
+    else:
+        click.echo(f"Using {len(endpoints)} endpoints for load balancing:", err=True)
+        for i, ep in enumerate(endpoints, 1):
+            click.echo(f"  {i}. {ep}", err=True)
 
     # Create Generator instance
     generator = Generator(
-        endpoint=endpoint,
+        endpoint=endpoints,
         seed=int(seed),
         output_folder=Path(output_folder),
         echo=lambda msg: click.echo(msg, err=True),
