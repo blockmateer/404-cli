@@ -1,5 +1,4 @@
 import asyncio
-import itertools
 from pathlib import Path
 from typing import Callable
 
@@ -31,8 +30,9 @@ class Generator:
         else:
             self.endpoints = endpoint
         
-        # Create round-robin iterator for load balancing
-        self.endpoint_cycle = itertools.cycle(self.endpoints)
+        # Create a queue of available endpoints for proper load balancing
+        # Each endpoint can only handle one request at a time
+        self.endpoint_queue: asyncio.Queue[str] | None = None
         
         self.seed = seed
         self.output_folder = Path(output_folder)
@@ -64,21 +64,21 @@ class Generator:
         try:
             self.echo(f"Processing {len(prompts)} prompts...")
             
-            # Configure concurrency based on number of endpoints
+            # Initialize endpoint queue - each endpoint can handle one request at a time
+            self.endpoint_queue = asyncio.Queue()
+            for endpoint in self.endpoints:
+                await self.endpoint_queue.put(endpoint)
+            
             num_endpoints = len(self.endpoints)
-            # Allow 1 concurrent request per GPU (can be increased to 2 per GPU for higher throughput)
-            request_sem = asyncio.Semaphore(num_endpoints)
             # Limit total processing to avoid overwhelming the system
             process_sem = asyncio.Semaphore(num_endpoints * 2)
             
-            self.echo(f"Concurrency: {num_endpoints} concurrent requests, {num_endpoints * 2} max in-flight")
+            self.echo(f"Concurrency: {num_endpoints} endpoints (1 request per endpoint), {num_endpoints * 2} max in-flight")
             
             tasks = [
                 asyncio.create_task(
                     self._process_prompt(
-                        request_sem=request_sem,
                         process_sem=process_sem,
-                        endpoint=next(self.endpoint_cycle),  # Round-robin endpoint selection
                         prompt=prompt,
                     )
                 )
@@ -109,18 +109,14 @@ class Generator:
     async def _process_prompt(
         self,
         *,
-        request_sem: asyncio.Semaphore,
         process_sem: asyncio.Semaphore,
-        endpoint: str,
         prompt: str,
     ) -> None:
         """
         Downloads a prompt image from a public URL, generates a 3D model from it, and saves the result locally.
 
         Args:
-            request_sem: Semaphore to limit concurrent requests
             process_sem: Semaphore to limit concurrent processing
-            endpoint: Targon container endpoint URL
             prompt: Image URL to process
 
         Raises:
@@ -137,8 +133,6 @@ class Generator:
                 response.raise_for_status()
                 image = response.content
                 result = await self._generate_with_retries(
-                    request_sem=request_sem,
-                    endpoint=endpoint,
                     image=image,
                     prompt_key=prompt_key,
                 )
@@ -156,8 +150,6 @@ class Generator:
     async def _generate_with_retries(
         self,
         *,
-        request_sem: asyncio.Semaphore,
-        endpoint: str,
         image: bytes,
         prompt_key: str,
     ) -> bytes | None:
@@ -165,8 +157,6 @@ class Generator:
         Generates a 3D model from an image using the Targon container with retries.
 
         Args:
-            request_sem: Semaphore to limit concurrent requests
-            endpoint: Targon container endpoint URL
             image: Image bytes to process
             prompt_key: Unique identifier for the prompt
 
@@ -192,8 +182,6 @@ class Generator:
                 await asyncio.sleep(backoff)
 
             result = await self._generate_attempt(
-                request_sem=request_sem,
-                endpoint=endpoint,
                 image=image,
                 prompt_key=prompt_key,
             )
@@ -206,29 +194,26 @@ class Generator:
     async def _generate_attempt(
         self,
         *,
-        request_sem: asyncio.Semaphore,
-        endpoint: str,
         image: bytes,
         prompt_key: str,
     ) -> bytes | None:
         """
         Single generation attempt.
+        Gets an available endpoint from the queue, uses it, then returns it to the queue.
 
         Args:
-            request_sem: Semaphore to limit concurrent requests
-            endpoint: Targon container endpoint URL
             image: Image bytes to process
             prompt_key: Unique identifier for the prompt
 
         Returns:
             Generated model bytes, or None if the attempt failed
         """
-        sem_released = False
-        await request_sem.acquire()
+        # Wait for an available endpoint (blocks until one is free)
+        endpoint = await self.endpoint_queue.get()
         
         # Extract port from endpoint for logging
         port = endpoint.split(":")[-1].split("/")[0] if ":" in endpoint else "unknown"
-        self.echo(f"Prompt {prompt_key} → endpoint port {port}")
+        self.echo(f"Prompt {prompt_key} → endpoint port {port} (acquired)")
 
         try:
             timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
@@ -244,15 +229,12 @@ class Generator:
                         response.raise_for_status()
 
                         elapsed = asyncio.get_running_loop().time() - start_time
-
-                        request_sem.release()
-                        sem_released = True
-
                         self.echo(f"Prompt {prompt_key} [port {port}] generation completed in {elapsed:.1f}s")
 
                         try:
                             content = await response.aread()
                         except Exception as e:
+                            self.echo(f"Prompt {prompt_key} [port {port}] download failed: {e}")
                             return None
 
                         download_time = asyncio.get_running_loop().time() - start_time - elapsed
@@ -269,5 +251,6 @@ class Generator:
                     return None
 
         finally:
-            if not sem_released:
-                request_sem.release()
+            # Always return the endpoint to the queue so it can be reused
+            await self.endpoint_queue.put(endpoint)
+            self.echo(f"Prompt {prompt_key} → endpoint port {port} (released)")
